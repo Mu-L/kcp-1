@@ -26,12 +26,10 @@ import (
 	"github.com/kcp-dev/logicalcluster/v3"
 
 	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/util/sets"
-	authserviceaccount "k8s.io/apiserver/pkg/authentication/serviceaccount"
-	"k8s.io/apiserver/pkg/authentication/user"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
 	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
 	controlplaneapiserver "k8s.io/kubernetes/pkg/controlplane/apiserver"
+	rbacregistryvalidation "k8s.io/kubernetes/pkg/registry/rbac/validation"
 	"k8s.io/kubernetes/plugin/pkg/auth/authorizer/rbac"
 
 	"github.com/kcp-dev/kcp/pkg/authorization/bootstrap"
@@ -44,25 +42,27 @@ const (
 	WorkspaceAccessNotPermittedReason = "workspace access not permitted"
 )
 
-func NewWorkspaceContentAuthorizer(localInformers, globalInformers kcpkubernetesinformers.SharedInformerFactory, localLogicalClusterLister, globalLogicalClusterLister corev1alpha1listers.LogicalClusterClusterLister, delegate authorizer.Authorizer) authorizer.Authorizer {
-	return &workspaceContentAuthorizer{
-		localClusterRoleLister:        localInformers.Rbac().V1().ClusterRoles().Lister(),
-		localClusterRoleBindingLister: localInformers.Rbac().V1().ClusterRoleBindings().Lister(),
+func NewWorkspaceContentAuthorizer(localInformers, globalInformers kcpkubernetesinformers.SharedInformerFactory, localLogicalClusterLister, globalLogicalClusterLister corev1alpha1listers.LogicalClusterClusterLister) func(delegate authorizer.Authorizer) authorizer.Authorizer {
+	return func(delegate authorizer.Authorizer) authorizer.Authorizer {
+		return &workspaceContentAuthorizer{
+			localClusterRoleLister:        localInformers.Rbac().V1().ClusterRoles().Lister(),
+			localClusterRoleBindingLister: localInformers.Rbac().V1().ClusterRoleBindings().Lister(),
 
-		globalClusterRoleLister:        globalInformers.Rbac().V1().ClusterRoles().Lister(),
-		globalClusterRoleBindingLister: globalInformers.Rbac().V1().ClusterRoleBindings().Lister(),
+			globalClusterRoleLister:        globalInformers.Rbac().V1().ClusterRoles().Lister(),
+			globalClusterRoleBindingLister: globalInformers.Rbac().V1().ClusterRoleBindings().Lister(),
 
-		getLogicalCluster: func(logicalCluster logicalcluster.Name) (*corev1alpha1.LogicalCluster, error) {
-			obj, err := localLogicalClusterLister.Cluster(logicalCluster).Get(corev1alpha1.LogicalClusterName)
-			if err != nil && !errors.IsNotFound(err) {
-				return nil, err
-			} else if errors.IsNotFound(err) {
-				return globalLogicalClusterLister.Cluster(logicalCluster).Get(corev1alpha1.LogicalClusterName)
-			}
-			return obj, nil
-		},
+			getLogicalCluster: func(logicalCluster logicalcluster.Name) (*corev1alpha1.LogicalCluster, error) {
+				obj, err := localLogicalClusterLister.Cluster(logicalCluster).Get(corev1alpha1.LogicalClusterName)
+				if err != nil && !errors.IsNotFound(err) {
+					return nil, err
+				} else if errors.IsNotFound(err) {
+					return globalLogicalClusterLister.Cluster(logicalCluster).Get(corev1alpha1.LogicalClusterName)
+				}
+				return obj, nil
+			},
 
-		delegate: delegate,
+			delegate: delegate,
+		}
 	}
 }
 
@@ -87,32 +87,16 @@ func (a *workspaceContentAuthorizer) Authorize(ctx context.Context, attr authori
 		return authorizer.DecisionNoOpinion, "empty or system workspace", nil
 	}
 
-	subjectClusters := map[logicalcluster.Name]bool{}
-	for _, sc := range attr.GetUser().GetExtra()[authserviceaccount.ClusterNameKey] {
-		subjectClusters[logicalcluster.Name(sc)] = true
-	}
-
-	isAuthenticated := sets.New[string](attr.GetUser().GetGroups()...).Has("system:authenticated")
-	isUser := len(subjectClusters) == 0
-	isServiceAccountFromCluster := subjectClusters[cluster.Name]
+	isServiceAccount := rbacregistryvalidation.IsServiceAccount(attr.GetUser())
+	isInScope := rbacregistryvalidation.IsInScope(attr.GetUser(), cluster.Name)
 
 	if IsDeepSubjectAccessReviewFrom(ctx, attr) {
-		attr := deepCopyAttributes(attr)
-		// this is a deep SAR request, we have to skip the checks here and delegate to the subsequent authorizer.
-		if isAuthenticated && !isUser && !isServiceAccountFromCluster {
-			// service accounts from other workspaces might conflict with local service accounts by name.
-			// This could lead to unwanted side effects of unwanted applied permissions.
-			// Hence, these requests have to be anonymized.
-			attr.User = &user.DefaultInfo{
-				Name:   "system:anonymous",
-				Groups: []string{"system:authenticated"},
-			}
-		}
 		return DelegateAuthorization("deep SAR request", a.delegate).Authorize(ctx, attr)
 	}
 
 	// always let logical-cluster-admins through
-	if isUser && sets.New[string](attr.GetUser().GetGroups()...).Has(bootstrap.SystemLogicalClusterAdmin) {
+	effGroups := rbacregistryvalidation.EffectiveGroups(ctx, attr.GetUser())
+	if effGroups.Has(bootstrap.SystemLogicalClusterAdmin) {
 		return DelegateAuthorization("logical cluster admin access", a.delegate).Authorize(ctx, attr)
 	}
 
@@ -130,15 +114,11 @@ func (a *workspaceContentAuthorizer) Authorize(ctx context.Context, attr authori
 	}
 
 	switch {
-	case !isUser && !isServiceAccountFromCluster:
-		// service accounts from other workspaces cannot access
-		return authorizer.DecisionDeny, "foreign service account", nil
-
-	case isServiceAccountFromCluster:
-		// A service account declared in the requested workspace is authorized inside that workspace.
+	case isServiceAccount && isInScope:
+		// A service account declared in the requested workspace is always authorized inside that workspace.
 		return DelegateAuthorization("local service account access", a.delegate).Authorize(ctx, attr)
 
-	case isUser:
+	default:
 		authz := rbac.New(
 			&rbac.RoleGetter{Lister: rbacwrapper.NewMergedRoleLister()},
 			&rbac.RoleBindingLister{Lister: rbacwrapper.NewMergedRoleBindingLister()},
@@ -170,6 +150,4 @@ func (a *workspaceContentAuthorizer) Authorize(ctx context.Context, attr authori
 		}
 		return DelegateAuthorization("user logical cluster access", a.delegate).Authorize(ctx, attr)
 	}
-
-	return authorizer.DecisionNoOpinion, "unknown user type", nil
 }
