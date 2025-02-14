@@ -397,8 +397,8 @@ func NewConfig(ctx context.Context, opts kcpserveroptions.CompletedOptions) (*Co
 	c.preHandlerChainMux = &handlerChainMuxes{}
 	c.GenericConfig.BuildHandlerChainFunc = func(apiHandler http.Handler, genericConfig *genericapiserver.Config) (secure http.Handler) {
 		apiHandler = openapiv3.WithOpenAPIv3(apiHandler, c.openAPIv3ServiceCache) // will be initialized further down after apiextensions-apiserver
-		apiHandler = WithWildcardListWatchGuard(apiHandler)
-		apiHandler = WithRequestIdentity(apiHandler)
+		apiHandler = kcpfilters.WithWildcardListWatchGuard(apiHandler)
+		apiHandler = kcpfilters.WithResourceIdentity(apiHandler)
 		apiHandler = authorization.WithSubjectAccessReviewAuditAnnotations(apiHandler)
 		apiHandler = authorization.WithDeepSubjectAccessReview(apiHandler)
 
@@ -442,8 +442,14 @@ func NewConfig(ctx context.Context, opts kcpserveroptions.CompletedOptions) (*Co
 			apiHandler = WithVirtualWorkspacesProxy(apiHandler, shardVirtualWorkspaceURL, virtualWorkspaceServerProxyTransport, proxy)
 		}
 
+		// There is ordering here in play:
+		// 1. Default handlers up to impersonation gatekeeper preventing impersonation of the privileged user.
+		// 2. Rest of the handlers up to Authz
+		// 3. Scoping handlers to ensure that the request is scoped to the user's clusters before authz is done.
+		// 4. Rest of the handlers.
+		apiHandler = kcpfilters.WithImpersonationScoping(apiHandler)
 		apiHandler = genericapiserver.DefaultBuildHandlerChainFromImpersonationToAuthz(apiHandler, genericConfig)
-		apiHandler = WithImpersonationGatekeeper(apiHandler)
+		apiHandler = kcpfilters.WithImpersonationGatekeeper(apiHandler)
 		apiHandler = genericapiserver.DefaultBuildHandlerChainFromStartToBeforeImpersonation(apiHandler, genericConfig)
 
 		// this will be replaced in DefaultBuildHandlerChain. So at worst we get twice as many warning.
@@ -472,9 +478,9 @@ func NewConfig(ctx context.Context, opts kcpserveroptions.CompletedOptions) (*Co
 		if err != nil {
 			panic(err) // shouldn't happen due to flag validation
 		}
-		apiHandler = WithInClusterServiceAccountRequestRewrite(apiHandler)
+		apiHandler = kcpfilters.WithInClusterServiceAccountRequestRewrite(apiHandler)
 		apiHandler = kcpfilters.WithAcceptHeader(apiHandler)
-		apiHandler = WithUserAgent(apiHandler)
+		apiHandler = kcpfilters.WithUserAgent(apiHandler)
 
 		return apiHandler
 	}

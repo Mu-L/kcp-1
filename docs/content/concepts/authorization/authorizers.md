@@ -13,18 +13,17 @@ In kcp, a request has four different ways of being admitted:
 * It can be permitted by an external HTTPS webhook backend.
 
 They are related in the following way:
-
 ``` mermaid
 graph TD
     start(Request):::state --> main_alt[/one of\]:::or
-    main_alt --> aapa[Always Allow Paths Auth]
     main_alt --> aaga[Always Allow Groups Auth]
-    main_alt --> wa[Webhook Auth]
+    main_alt --> aapa[Always Allow Paths Auth]
     main_alt --> rga[Required Groups Auth]
+    main_alt --> wa[Webhook Auth]
 
-    aapa --> decision(Decision):::state
-    aaga --> decision
-    wa --> decision
+
+    aaga --> decision(Decision):::state
+    aapa --> decision
 
     subgraph "RBAC"
     rga --> wca[Workspace Content Auth]
@@ -40,6 +39,7 @@ graph TD
     lpa --> decision
     gpa --> decision
     bpa --> decision
+    wa --> decision
 
     classDef state color:#F77
     classDef or fill:none,stroke:none
@@ -276,5 +276,104 @@ The webhook will receive JSON-marshalled `SubjectAccessReview` objects, that (co
 }
 ```
 
-!!! note
     The extra field will contain the logical cluster _name_ (e.g. o43u2gh528rtfg721rg92), not the human-readable path. Webhooks need to resolve the name to a path themselves if necessary.
+
+### Authorizer Order
+
+By default, the authorizers are evaluated in the following order:
+
+1. **Always Allow Groups Authorizer** (`AlwaysAllowGroups`)
+2. **Always Allow Paths Authorizer** (`AlwaysAllowPaths`)
+3. **RBAC Chain** (`RBAC`)
+4. **Webhook Authorizer** (`Webhook`)
+
+The order in which authorizers are evaluated can be configured. This allows administrators to customize the authorization flow.
+It can be done by setting `--authorization-order` flag in the kcp server. This flag accepts a comma-separated list of authorizer names, which will be evaluated in the specified order.
+
+Here is an example on how to enable the Webhook to be the first one in the authorizers chain:
+```sh
+--authorization-order=Webhook,AlwaysAllowGroups,AlwaysAllowPaths,RBAC
+```
+
+### Scopes
+
+Scopes are a way to limit the access of a user to a specific logical cluster.
+Scopes are (optionally) attached to the user identity by setting the
+`authentication.kcp.io/scopes: cluster:<logical-cluster>,...` extra field. The
+scope is then checked by the authorizers. For example:
+
+```yaml
+user: user1
+groups: ["group1"]
+extra:
+  authentication.kcp.io/scopes:
+  - cluster:logical-cluster-1
+```
+This user will only be allowed to access resources in `logical-cluster-1`,
+falling back to be considered as user `system:anonymous` with group
+`system:authenticated` in all other logical clusters.
+
+Each extra field can contain multiple scopes, separated by a comma:
+```yaml
+user: user1
+groups: ["group1"]
+extra:
+  authentication.kcp.io/scopes:
+  - cluster:logical-cluster-1,cluster:logical-cluster-2
+```
+This user is allowed to operate in both `logical-cluster-1` and
+`logical-cluster-2`, falling back to be considered as user `system:anonymous`
+with group `system:authenticated` in all other logical clusters.
+
+If multiple `authentication.kcp.io/scopes` values are set, the intersection is
+taken:
+```yaml
+user: user1
+groups: ["group1"]
+extra:
+  authentication.kcp.io/scopes:
+  - cluster:logical-cluster-1,cluster:logical-cluster-2
+  - cluster:logical-cluster-2,cluster:logical-cluster-3
+```
+This user is only allowed to operate in `logical-cluster-2`, falling back to be
+considered as user `system:anonymous` with group `system:authenticated` in all
+other logical clusters.
+
+The intersection can be empty, in which case it falls back in every logical
+cluster.
+
+When impersonating a user in a logical cluster, the resulting user identity is
+scoped to the logical cluster the impersonation is happening in.
+
+A scope mismatch does not invalidate the warrants (see next section) of a user.
+
+### Warrants
+
+Warrants are a way to grant extra access to a user. It can be limited by the scope of a logical cluster.
+A warrant is attached by adding a `authorization.kcp.io/warrant` extra field to the user identity
+with a JSON-encoded user info, and the limiting logical cluster set as `authentication.kcp.io/scopes: cluster:<logical-cluster>`.
+in the embedded user info's extra. The warrant is then checked by the authorizers in the chain of every step
+if the primary users is not allowed. For example:
+
+```yaml
+user: user1
+groups: ["group1"]
+extra:
+  authorization.kcp.io/warrant: |
+    {
+      "user": "user2",
+      "groups": ["group2"],
+      "extra": {
+        "authentication.kcp.io/scopes": "cluster:logical-cluster-1"
+      }
+    }
+```
+
+This warrant allows `user1` to act under the permissions of `user2` in
+`logical-cluster-1` if `user1` is not allowed to act as `user2` in the first place.
+
+Note that a warrant only allow to act under the permissions of the warrant user,
+but not to act as the warrant user itself. E.g. in auditing or admission control,
+the primary user is still the one that is acting.
+
+Warrants can be nested, i.e. a warrant can contain another warrant.
