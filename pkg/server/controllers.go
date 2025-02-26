@@ -63,9 +63,11 @@ import (
 	"github.com/kcp-dev/kcp/pkg/reconciler/apis/apibindingdeletion"
 	"github.com/kcp-dev/kcp/pkg/reconciler/apis/apiexport"
 	"github.com/kcp-dev/kcp/pkg/reconciler/apis/apiexportendpointslice"
+	"github.com/kcp-dev/kcp/pkg/reconciler/apis/apiexportendpointsliceurls"
 	"github.com/kcp-dev/kcp/pkg/reconciler/apis/crdcleanup"
 	"github.com/kcp-dev/kcp/pkg/reconciler/apis/extraannotationsync"
 	"github.com/kcp-dev/kcp/pkg/reconciler/apis/identitycache"
+	"github.com/kcp-dev/kcp/pkg/reconciler/apis/logicalclustercleanup"
 	"github.com/kcp-dev/kcp/pkg/reconciler/apis/permissionclaimlabel"
 	apisreplicateclusterrole "github.com/kcp-dev/kcp/pkg/reconciler/apis/replicateclusterrole"
 	apisreplicateclusterrolebinding "github.com/kcp-dev/kcp/pkg/reconciler/apis/replicateclusterrolebinding"
@@ -748,6 +750,7 @@ func (s *Server) installAPIBindingController(ctx context.Context, config *rest.C
 		s.KcpSharedInformerFactory.Apis().V1alpha1().APIExports(),
 		s.KcpSharedInformerFactory.Apis().V1alpha1().APIResourceSchemas(),
 		s.KcpSharedInformerFactory.Apis().V1alpha1().APIConversions(),
+		s.KcpSharedInformerFactory.Core().V1alpha1().LogicalClusters(),
 		s.CacheKcpSharedInformerFactory.Apis().V1alpha1().APIExports(),
 		s.CacheKcpSharedInformerFactory.Apis().V1alpha1().APIResourceSchemas(),
 		s.CacheKcpSharedInformerFactory.Apis().V1alpha1().APIConversions(),
@@ -986,6 +989,40 @@ func (s *Server) installCRDCleanupController(ctx context.Context, config *rest.C
 		Wait: func(ctx context.Context, s *Server) error {
 			return wait.PollUntilContextCancel(ctx, waitPollInterval, true, func(ctx context.Context) (bool, error) {
 				return s.ApiExtensionsSharedInformerFactory.Apiextensions().V1().CustomResourceDefinitions().Informer().HasSynced() &&
+					s.KcpSharedInformerFactory.Apis().V1alpha1().APIBindings().Informer().HasSynced(), nil
+			})
+		},
+		Runner: func(ctx context.Context) {
+			c.Start(ctx, 2)
+		},
+	})
+}
+
+func (s *Server) installLogicalClusterCleanupController(ctx context.Context, config *rest.Config) error {
+	config = rest.CopyConfig(config)
+	config = rest.AddUserAgent(config, logicalclustercleanup.ControllerName)
+
+	kcpClusterClient, err := kcpclientset.NewForConfig(config)
+	if err != nil {
+		return err
+	}
+
+	c, err := logicalclustercleanup.NewController(
+		kcpClusterClient,
+		s.KcpSharedInformerFactory.Core().V1alpha1().LogicalClusters(),
+		s.ApiExtensionsSharedInformerFactory.Apiextensions().V1().CustomResourceDefinitions(),
+		s.KcpSharedInformerFactory.Apis().V1alpha1().APIBindings(),
+	)
+	if err != nil {
+		return err
+	}
+
+	return s.registerController(&controllerWrapper{
+		Name: logicalclustercleanup.ControllerName,
+		Wait: func(ctx context.Context, s *Server) error {
+			return wait.PollUntilContextCancel(ctx, waitPollInterval, true, func(ctx context.Context) (bool, error) {
+				return s.KcpSharedInformerFactory.Core().V1alpha1().LogicalClusters().Informer().HasSynced() &&
+					s.ApiExtensionsSharedInformerFactory.Apiextensions().V1().CustomResourceDefinitions().Informer().HasSynced() &&
 					s.KcpSharedInformerFactory.Apis().V1alpha1().APIBindings().Informer().HasSynced(), nil
 			})
 		},
@@ -1266,7 +1303,7 @@ func (s *Server) installTenancyReplicateClusterRoleBindingControllers(ctx contex
 	})
 }
 
-func (s *Server) installAPIExportEndpointSliceController(ctx context.Context, config *rest.Config) error {
+func (s *Server) installAPIExportEndpointSliceController(_ context.Context, config *rest.Config) error {
 	config = rest.CopyConfig(config)
 	config = rest.AddUserAgent(config, apiexportendpointslice.ControllerName)
 
@@ -1278,7 +1315,6 @@ func (s *Server) installAPIExportEndpointSliceController(ctx context.Context, co
 	c, err := apiexportendpointslice.NewController(
 		s.KcpSharedInformerFactory.Apis().V1alpha1().APIExportEndpointSlices(),
 		// Shards and APIExports get retrieved from cache server
-		s.CacheKcpSharedInformerFactory.Core().V1alpha1().Shards(),
 		s.CacheKcpSharedInformerFactory.Apis().V1alpha1().APIExports(),
 		s.KcpSharedInformerFactory.Topology().V1alpha1().Partitions(),
 		kcpClusterClient,
@@ -1291,10 +1327,49 @@ func (s *Server) installAPIExportEndpointSliceController(ctx context.Context, co
 		Name: apiexportendpointslice.ControllerName,
 		Wait: func(ctx context.Context, s *Server) error {
 			return wait.PollUntilContextCancel(ctx, waitPollInterval, true, func(ctx context.Context) (bool, error) {
-				return s.CacheKcpSharedInformerFactory.Core().V1alpha1().Shards().Informer().HasSynced() &&
-					s.KcpSharedInformerFactory.Apis().V1alpha1().APIExportEndpointSlices().Informer().HasSynced() &&
+				return s.KcpSharedInformerFactory.Apis().V1alpha1().APIExportEndpointSlices().Informer().HasSynced() &&
 					s.CacheKcpSharedInformerFactory.Apis().V1alpha1().APIExports().Informer().HasSynced() &&
 					s.KcpSharedInformerFactory.Topology().V1alpha1().Partitions().Informer().HasSynced(), nil
+			})
+		},
+		Runner: func(ctx context.Context) {
+			c.Start(ctx, 2)
+		},
+	})
+}
+
+func (s *Server) installAPIExportEndpointSliceURLsController(_ context.Context, _ *rest.Config) error {
+	config := rest.CopyConfig(s.ExternalLogicalClusterAdminConfig)
+	config = rest.AddUserAgent(config, apiexportendpointsliceurls.ControllerName)
+
+	kcpClusterClient, err := kcpclientset.NewForConfig(config)
+	if err != nil {
+		return err
+	}
+
+	c, err := apiexportendpointsliceurls.NewController(
+		s.Options.Extra.ShardName,
+		s.KcpSharedInformerFactory.Apis().V1alpha1().APIExportEndpointSlices(),
+		s.KcpSharedInformerFactory.Apis().V1alpha1().APIBindings(),
+		// Shards and APIExports get retrieved from cache server
+		s.CacheKcpSharedInformerFactory.Apis().V1alpha1().APIExportEndpointSlices(),
+		s.CacheKcpSharedInformerFactory.Core().V1alpha1().Shards(),
+		s.CacheKcpSharedInformerFactory.Apis().V1alpha1().APIExports(),
+		kcpClusterClient,
+	)
+	if err != nil {
+		return err
+	}
+
+	return s.registerController(&controllerWrapper{
+		Name: apiexportendpointsliceurls.ControllerName,
+		Wait: func(ctx context.Context, s *Server) error {
+			return wait.PollUntilContextCancel(ctx, waitPollInterval, true, func(ctx context.Context) (bool, error) {
+				return s.CacheKcpSharedInformerFactory.Core().V1alpha1().Shards().Informer().HasSynced() &&
+					s.KcpSharedInformerFactory.Apis().V1alpha1().APIExportEndpointSlices().Informer().HasSynced() &&
+					s.CacheKcpSharedInformerFactory.Apis().V1alpha1().APIExportEndpointSlices().Informer().HasSynced() &&
+					s.CacheKcpSharedInformerFactory.Apis().V1alpha1().APIExports().Informer().HasSynced() &&
+					s.KcpSharedInformerFactory.Apis().V1alpha1().APIBindings().Informer().HasSynced(), nil
 			})
 		},
 		Runner: func(ctx context.Context) {
@@ -1533,39 +1608,57 @@ func (s *Server) WaitForSync(stop <-chan struct{}) error {
 
 // addIndexerstoInformers is separated out from controllers as the re-election calls for controller re-initialization,
 // it would panics in indexer addition to informers as they are already started at bootup.
-func (s *Server) addIndexersToInformers(ctx context.Context) map[schema.GroupVersionResource]replication.ReplicatedGVR {
-	permissionclaimlabel.InstallIndexers(s.KcpSharedInformerFactory.Apis().V1alpha1().APIExports(), s.KcpSharedInformerFactory.Apis().V1alpha1().APIBindings())
-	permissionclaimlabler.InstallIndexers(s.KcpSharedInformerFactory.Apis().V1alpha1().APIExports())
+func (s *Server) addIndexersToInformers(_ context.Context) map[schema.GroupVersionResource]replication.ReplicatedGVR {
+	permissionclaimlabel.InstallIndexers(
+		s.KcpSharedInformerFactory.Apis().V1alpha1().APIExports(),
+		s.KcpSharedInformerFactory.Apis().V1alpha1().APIBindings(),
+	)
+	permissionclaimlabler.InstallIndexers(
+		s.KcpSharedInformerFactory.Apis().V1alpha1().APIExports())
 	apibinding.InstallIndexers(
 		s.KcpSharedInformerFactory.Apis().V1alpha1().APIBindings(),
 		s.KcpSharedInformerFactory.Apis().V1alpha1().APIExports(),
-		s.CacheKcpSharedInformerFactory.Apis().V1alpha1().APIExports())
-	apiexport.InstallIndexers(s.KcpSharedInformerFactory.Apis().V1alpha1().APIExports())
-	apiexportendpointslice.InstallIndexers(s.CacheKcpSharedInformerFactory.Apis().V1alpha1().APIExports(),
-		s.KcpSharedInformerFactory.Apis().V1alpha1().APIExportEndpointSlices())
-	labelclusterrolebindings.InstallIndexers(s.KubeSharedInformerFactory.Rbac().V1().ClusterRoleBindings())
-	labelclusterroles.InstallIndexers(s.KubeSharedInformerFactory.Rbac().V1().ClusterRoleBindings())
-	workspace.InstallIndexers(s.KcpSharedInformerFactory.Tenancy().V1alpha1().Workspaces(),
+		s.CacheKcpSharedInformerFactory.Apis().V1alpha1().APIExports(),
+	)
+	apiexport.InstallIndexers(
+		s.KcpSharedInformerFactory.Apis().V1alpha1().APIExports())
+	apiexportendpointslice.InstallIndexers(
+		s.CacheKcpSharedInformerFactory.Apis().V1alpha1().APIExports(),
+		s.KcpSharedInformerFactory.Apis().V1alpha1().APIExportEndpointSlices(),
+	)
+	apiexportendpointsliceurls.InstallIndexers(
+		s.CacheKcpSharedInformerFactory.Apis().V1alpha1().APIExportEndpointSlices(),
+		s.KcpSharedInformerFactory.Apis().V1alpha1().APIExportEndpointSlices(),
+		s.KcpSharedInformerFactory.Apis().V1alpha1().APIBindings(),
+	)
+	labelclusterrolebindings.InstallIndexers(
+		s.KubeSharedInformerFactory.Rbac().V1().ClusterRoleBindings(),
+	)
+	labelclusterroles.InstallIndexers(
+		s.KubeSharedInformerFactory.Rbac().V1().ClusterRoleBindings(),
+	)
+	workspace.InstallIndexers(
+		s.KcpSharedInformerFactory.Tenancy().V1alpha1().Workspaces(),
 		s.CacheKcpSharedInformerFactory.Core().V1alpha1().Shards(),
-		s.CacheKcpSharedInformerFactory.Tenancy().V1alpha1().WorkspaceTypes())
-
+		s.CacheKcpSharedInformerFactory.Tenancy().V1alpha1().WorkspaceTypes(),
+	)
+	workspacemounts.InstallIndexers(
+		s.KcpSharedInformerFactory.Tenancy().V1alpha1().Workspaces(),
+	)
 	extraannotationsync.InstallIndexers(
 		s.KcpSharedInformerFactory.Apis().V1alpha1().APIExports(),
-		s.KcpSharedInformerFactory.Apis().V1alpha1().APIBindings())
-
-	// Replicationcontroller indexers
-	localKcpInformers := s.KcpSharedInformerFactory
-	globalKcpInformers := s.CacheKcpSharedInformerFactory
-	localKubeInformers := s.KubeSharedInformerFactory
-	globalKubeInformers := s.CacheKubeSharedInformerFactory
-
-	gvrs := replication.InstallIndexers(localKcpInformers,
-		globalKcpInformers, localKubeInformers,
-		globalKubeInformers)
-
+		s.KcpSharedInformerFactory.Apis().V1alpha1().APIBindings(),
+	)
 	initialization.InstallIndexers(
 		s.KcpSharedInformerFactory.Tenancy().V1alpha1().WorkspaceTypes(),
 		s.CacheKcpSharedInformerFactory.Tenancy().V1alpha1().WorkspaceTypes())
-	crdcleanup.InstallIndexers(s.KcpSharedInformerFactory.Apis().V1alpha1().APIBindings())
-	return gvrs
+	crdcleanup.InstallIndexers(
+		s.KcpSharedInformerFactory.Apis().V1alpha1().APIBindings(),
+	)
+	return replication.InstallIndexers(
+		s.KcpSharedInformerFactory,
+		s.CacheKcpSharedInformerFactory,
+		s.KubeSharedInformerFactory,
+		s.CacheKubeSharedInformerFactory,
+	)
 }

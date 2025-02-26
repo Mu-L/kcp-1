@@ -79,6 +79,7 @@ func GetOpenAPIDefinitions(ref common.ReferenceCallback) map[string]common.OpenA
 		"github.com/kcp-dev/kcp/sdk/apis/tenancy/v1alpha1.Mount":                                    schema_sdk_apis_tenancy_v1alpha1_Mount(ref),
 		"github.com/kcp-dev/kcp/sdk/apis/tenancy/v1alpha1.MountSpec":                                schema_sdk_apis_tenancy_v1alpha1_MountSpec(ref),
 		"github.com/kcp-dev/kcp/sdk/apis/tenancy/v1alpha1.MountStatus":                              schema_sdk_apis_tenancy_v1alpha1_MountStatus(ref),
+		"github.com/kcp-dev/kcp/sdk/apis/tenancy/v1alpha1.ObjectReference":                          schema_sdk_apis_tenancy_v1alpha1_ObjectReference(ref),
 		"github.com/kcp-dev/kcp/sdk/apis/tenancy/v1alpha1.VirtualWorkspace":                         schema_sdk_apis_tenancy_v1alpha1_VirtualWorkspace(ref),
 		"github.com/kcp-dev/kcp/sdk/apis/tenancy/v1alpha1.Workspace":                                schema_sdk_apis_tenancy_v1alpha1_Workspace(ref),
 		"github.com/kcp-dev/kcp/sdk/apis/tenancy/v1alpha1.WorkspaceList":                            schema_sdk_apis_tenancy_v1alpha1_WorkspaceList(ref),
@@ -775,6 +776,14 @@ func schema_sdk_apis_apis_v1alpha1_APIExportEndpointSliceStatus(ref common.Refer
 						},
 					},
 					"endpoints": {
+						VendorExtensible: spec.VendorExtensible{
+							Extensions: spec.Extensions{
+								"x-kubernetes-list-map-keys": []interface{}{
+									"url",
+								},
+								"x-kubernetes-list-type": "map",
+							},
+						},
 						SchemaProps: spec.SchemaProps{
 							Description: "endpoints contains all the URLs of the APIExport service.",
 							Type:        []string{"array"},
@@ -786,6 +795,13 @@ func schema_sdk_apis_apis_v1alpha1_APIExportEndpointSliceStatus(ref common.Refer
 									},
 								},
 							},
+						},
+					},
+					"shardSelector": {
+						SchemaProps: spec.SchemaProps{
+							Description: "shardSelector is the selector used to filter the shards. It is used to filter the shards when determining partition scope when deriving the endpoints. This is set by owning shard, and is used by follower shards to determine if its inscope or not.",
+							Type:        []string{"string"},
+							Format:      "",
 						},
 					},
 				},
@@ -2293,14 +2309,14 @@ func schema_sdk_apis_tenancy_v1alpha1_MountSpec(ref common.ReferenceCallback) co
 					"ref": {
 						SchemaProps: spec.SchemaProps{
 							Description: "Reference is an ObjectReference to the object that is mounted.",
-							Ref:         ref("k8s.io/api/core/v1.ObjectReference"),
+							Ref:         ref("github.com/kcp-dev/kcp/sdk/apis/tenancy/v1alpha1.ObjectReference"),
 						},
 					},
 				},
 			},
 		},
 		Dependencies: []string{
-			"k8s.io/api/core/v1.ObjectReference"},
+			"github.com/kcp-dev/kcp/sdk/apis/tenancy/v1alpha1.ObjectReference"},
 	}
 }
 
@@ -2344,6 +2360,50 @@ func schema_sdk_apis_tenancy_v1alpha1_MountStatus(ref common.ReferenceCallback) 
 		},
 		Dependencies: []string{
 			"github.com/kcp-dev/kcp/sdk/apis/third_party/conditions/apis/conditions/v1alpha1.Condition"},
+	}
+}
+
+func schema_sdk_apis_tenancy_v1alpha1_ObjectReference(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Type: []string{"object"},
+				Properties: map[string]spec.Schema{
+					"apiVersion": {
+						SchemaProps: spec.SchemaProps{
+							Description: "APIVersion is the API group and version of the object.",
+							Default:     "",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"kind": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Kind is the kind of the object.",
+							Default:     "",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"name": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Name is the name of the object.",
+							Default:     "",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"namespace": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Namespace is the namespace of the object.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+				},
+				Required: []string{"apiVersion", "kind", "name"},
+			},
+		},
 	}
 }
 

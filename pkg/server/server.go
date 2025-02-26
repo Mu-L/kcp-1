@@ -252,6 +252,9 @@ func (s *Server) installControllers(ctx context.Context, controllerConfig *rest.
 		if err := s.installCRDCleanupController(ctx, controllerConfig); err != nil {
 			return err
 		}
+		if err := s.installLogicalClusterCleanupController(ctx, controllerConfig); err != nil {
+			return err
+		}
 		if err := s.installExtraAnnotationSyncController(ctx, controllerConfig); err != nil {
 			return err
 		}
@@ -312,6 +315,9 @@ func (s *Server) installControllers(ctx context.Context, controllerConfig *rest.
 
 	if s.Options.Controllers.EnableAll || enabled.Has("apiexportendpointslice") {
 		if err := s.installAPIExportEndpointSliceController(ctx, controllerConfig); err != nil {
+			return err
+		}
+		if err := s.installAPIExportEndpointSliceURLsController(ctx, controllerConfig); err != nil {
 			return err
 		}
 	}

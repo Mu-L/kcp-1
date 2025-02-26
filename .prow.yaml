@@ -106,6 +106,7 @@ presubmits:
       containers:
         - image: ghcr.io/kcp-dev/infra/build:1.22.10-1
           command:
+            - ./hack/run-with-prow.sh
             - ./hack/run-with-prometheus.sh
             - make
             - test-e2e
@@ -134,6 +135,7 @@ presubmits:
       containers:
         - image: ghcr.io/kcp-dev/infra/build:1.22.10-1
           command:
+            - ./hack/run-with-prow.sh
             - ./hack/run-with-prometheus.sh
             - make
             - test-e2e
@@ -164,6 +166,7 @@ presubmits:
       containers:
         - image: ghcr.io/kcp-dev/infra/build:1.22.10-1
           command:
+            - ./hack/run-with-prow.sh
             - ./hack/run-with-prometheus.sh
             - make
             - test-e2e-shared-minimal
@@ -190,6 +193,7 @@ presubmits:
       containers:
         - image: ghcr.io/kcp-dev/infra/build:1.22.10-1
           command:
+            - ./hack/run-with-prow.sh
             - ./hack/run-with-prometheus.sh
             - make
             - test-e2e-sharded-minimal

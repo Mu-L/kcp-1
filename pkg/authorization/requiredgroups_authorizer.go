@@ -24,10 +24,9 @@ import (
 	"github.com/kcp-dev/logicalcluster/v3"
 
 	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/util/sets"
-	authserviceaccount "k8s.io/apiserver/pkg/authentication/serviceaccount"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
 	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
+	rbacregistryvalidation "k8s.io/kubernetes/pkg/registry/rbac/validation"
 
 	"github.com/kcp-dev/kcp/pkg/authorization/bootstrap"
 	corev1alpha1 "github.com/kcp-dev/kcp/sdk/apis/core/v1alpha1"
@@ -42,18 +41,20 @@ const (
 
 // NewRequiredGroupsAuthorizer returns an authorizer that a set of groups stored
 // on the LogicalCluster object. Service account by-pass this.
-func NewRequiredGroupsAuthorizer(local, global corev1alpha1listers.LogicalClusterClusterLister, delegate authorizer.Authorizer) authorizer.Authorizer {
-	return &requiredGroupsAuthorizer{
-		getLogicalCluster: func(logicalCluster logicalcluster.Name) (*corev1alpha1.LogicalCluster, error) {
-			obj, err := local.Cluster(logicalCluster).Get(corev1alpha1.LogicalClusterName)
-			if err != nil && !errors.IsNotFound(err) {
-				return nil, err
-			} else if errors.IsNotFound(err) {
-				return global.Cluster(logicalCluster).Get(corev1alpha1.LogicalClusterName)
-			}
-			return obj, nil
-		},
-		delegate: delegate,
+func NewRequiredGroupsAuthorizer(local, global corev1alpha1listers.LogicalClusterClusterLister) func(delegate authorizer.Authorizer) authorizer.Authorizer {
+	return func(delegate authorizer.Authorizer) authorizer.Authorizer {
+		return &requiredGroupsAuthorizer{
+			getLogicalCluster: func(logicalCluster logicalcluster.Name) (*corev1alpha1.LogicalCluster, error) {
+				obj, err := local.Cluster(logicalCluster).Get(corev1alpha1.LogicalClusterName)
+				if err != nil && !errors.IsNotFound(err) {
+					return nil, err
+				} else if errors.IsNotFound(err) {
+					return global.Cluster(logicalCluster).Get(corev1alpha1.LogicalClusterName)
+				}
+				return obj, nil
+			},
+			delegate: delegate,
+		}
 	}
 }
 
@@ -73,25 +74,17 @@ func (a *requiredGroupsAuthorizer) Authorize(ctx context.Context, attr authorize
 		return authorizer.DecisionNoOpinion, "empty cluster name", nil
 	}
 
-	subjectClusters := map[logicalcluster.Path]bool{}
-	for _, sc := range attr.GetUser().GetExtra()[authserviceaccount.ClusterNameKey] {
-		subjectClusters[logicalcluster.NewPath(sc)] = true
-	}
-
-	isUser := len(subjectClusters) == 0
-	isServiceAccount := len(subjectClusters) > 0
-
-	// always let logical-cluster-admins through
-	if isUser && sets.New[string](attr.GetUser().GetGroups()...).Has(bootstrap.SystemLogicalClusterAdmin) {
+	effGroups := rbacregistryvalidation.EffectiveGroups(ctx, attr.GetUser())
+	if effGroups.Has(bootstrap.SystemLogicalClusterAdmin) {
 		return DelegateAuthorization("logical cluster admin access", a.delegate).Authorize(ctx, attr)
 	}
 
 	switch {
-	case isServiceAccount:
+	case rbacregistryvalidation.IsServiceAccount(attr.GetUser()):
 		// service accounts are always allowed
 		return DelegateAuthorization("service account access to logical cluster", a.delegate).Authorize(ctx, attr)
 
-	case isUser:
+	default:
 		// get logical cluster with required group annotation
 		logicalCluster, err := a.getLogicalCluster(cluster.Name)
 		if err != nil {
@@ -102,7 +95,7 @@ func (a *requiredGroupsAuthorizer) Authorize(ctx context.Context, attr authorize
 		}
 
 		// always let external-logical-cluster-admins through
-		if sets.New[string](attr.GetUser().GetGroups()...).Has(bootstrap.SystemExternalLogicalClusterAdmin) {
+		if effGroups.Has(bootstrap.SystemExternalLogicalClusterAdmin) {
 			return DelegateAuthorization("external logical cluster admin access", a.delegate).Authorize(ctx, attr)
 		}
 
@@ -114,13 +107,11 @@ func (a *requiredGroupsAuthorizer) Authorize(ctx context.Context, attr authorize
 		disjunctiveClauses := append(strings.Split(value, ";"), bootstrap.SystemKcpAdminGroup, bootstrap.SystemKcpWorkspaceBootstrapper)
 		for _, set := range disjunctiveClauses {
 			groups := strings.Split(set, ",")
-			if sets.New[string](attr.GetUser().GetGroups()...).HasAll(groups...) {
+			if effGroups.HasAll(groups...) {
 				return DelegateAuthorization(fmt.Sprintf("user is member of required groups: %s", logicalCluster.Annotations[RequiredGroupsAnnotationKey]), a.delegate).Authorize(ctx, attr)
 			}
 		}
 
 		return authorizer.DecisionDeny, fmt.Sprintf("user is not a member of required groups: %s", logicalCluster.Annotations[RequiredGroupsAnnotationKey]), nil
 	}
-
-	return authorizer.DecisionNoOpinion, WorkspaceAccessNotPermittedReason, nil
 }

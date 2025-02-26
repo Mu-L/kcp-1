@@ -40,20 +40,13 @@ import (
 	corev1alpha1listers "github.com/kcp-dev/kcp/sdk/client/listers/core/v1alpha1"
 )
 
-func newUser(name string, groups ...string) *user.DefaultInfo {
-	return &user.DefaultInfo{
-		Name:   name,
-		Groups: groups,
-	}
-}
-
 func newServiceAccountWithCluster(name string, cluster string, groups ...string) *user.DefaultInfo {
 	extra := make(map[string][]string)
 	if len(cluster) > 0 {
 		extra[authserviceaccount.ClusterNameKey] = []string{cluster}
 	}
 	return &user.DefaultInfo{
-		Name:   name,
+		Name:   "system:serviceaccount:" + name,
 		Extra:  extra,
 		Groups: groups,
 	}
@@ -85,7 +78,7 @@ func TestWorkspaceContentAuthorizer(t *testing.T) {
 			testName: "unknown requested workspace",
 
 			requestedWorkspace: "root:unknown",
-			requestingUser:     newUser("user-access"),
+			requestingUser:     &user.DefaultInfo{Name: "user-access"},
 			wantDecision:       authorizer.DecisionDeny,
 			wantReason:         "LogicalCluster not found",
 		},
@@ -93,7 +86,7 @@ func TestWorkspaceContentAuthorizer(t *testing.T) {
 			testName: "workspace without parent",
 
 			requestedWorkspace: "rootwithoutparent",
-			requestingUser:     newUser("user-access"),
+			requestingUser:     &user.DefaultInfo{Name: "user-access"},
 			wantDecision:       authorizer.DecisionAllow,
 			wantReason:         "delegating due to user logical cluster access",
 		},
@@ -101,7 +94,7 @@ func TestWorkspaceContentAuthorizer(t *testing.T) {
 			testName: "non-permitted user is not allowed",
 
 			requestedWorkspace: "root:ready",
-			requestingUser:     newUser("user-unknown"),
+			requestingUser:     &user.DefaultInfo{Name: "user-unknown"},
 			wantDecision:       authorizer.DecisionNoOpinion,
 			wantReason:         "no verb=access permission on /",
 		},
@@ -109,17 +102,37 @@ func TestWorkspaceContentAuthorizer(t *testing.T) {
 			testName: "permitted user is granted access",
 
 			requestedWorkspace: "root:ready",
-			requestingUser:     newUser("user-access", "system:authenticated"),
+			requestingUser:     &user.DefaultInfo{Name: "user-access", Groups: []string{"system:authenticated"}},
 			wantDecision:       authorizer.DecisionAllow,
 			wantReason:         "delegating due to user logical cluster access",
 		},
 		{
-			testName: "service account from other cluster is denied",
+			testName: "service account from other cluster is not allowed",
 
 			requestedWorkspace: "root:ready",
 			requestingUser:     newServiceAccountWithCluster("sa", "anotherws"),
-			wantDecision:       authorizer.DecisionDeny,
-			wantReason:         "foreign service account",
+			wantDecision:       authorizer.DecisionNoOpinion,
+			wantReason:         "no verb=access permission on /",
+		},
+		{
+			testName: "user with scope to this cluster is allowed",
+
+			requestedWorkspace: "root:ready",
+			requestingUser: &user.DefaultInfo{Name: "user-access", Extra: map[string][]string{
+				"authentication.kcp.io/scopes": {"cluster:root:ready"},
+			}},
+			wantDecision: authorizer.DecisionAllow,
+			wantReason:   "delegating due to user logical cluster access",
+		},
+		{
+			testName: "user with scope to another cluster is not allowed",
+
+			requestedWorkspace: "root:ready",
+			requestingUser: &user.DefaultInfo{Name: "user-access", Extra: map[string][]string{
+				"authentication.kcp.io/scopes": {"cluster:anotherws"},
+			}},
+			wantDecision: authorizer.DecisionNoOpinion,
+			wantReason:   "no verb=access permission on /",
 		},
 		{
 			testName: "service account from same cluster is granted access",
@@ -130,26 +143,26 @@ func TestWorkspaceContentAuthorizer(t *testing.T) {
 			wantReason:         "delegating due to local service account access",
 		},
 		{
-			testName: "user is granted access on root",
+			testName: "a authenticated user is granted access on root:authenticated",
 
-			requestedWorkspace: "root",
-			requestingUser:     newUser("somebody", "system:authenticated"),
+			requestedWorkspace: "root:authenticated",
+			requestingUser:     &user.DefaultInfo{Name: "somebody", Groups: []string{"system:authenticated"}},
 			wantDecision:       authorizer.DecisionAllow,
 			wantReason:         "delegating due to user logical cluster access",
 		},
 		{
-			testName: "service account from other cluster is denied on root",
+			testName: "service account from other cluster is granted access on root:authenticated", // as it act as system:anonymous+system:authenticated there.
 
-			requestedWorkspace: "root",
+			requestedWorkspace: "root:authenticated",
 			requestingUser:     newServiceAccountWithCluster("somebody", "someworkspace", "system:authenticated"),
-			wantDecision:       authorizer.DecisionDeny,
-			wantReason:         "foreign service account",
+			wantDecision:       authorizer.DecisionAllow,
+			wantReason:         "delegating due to user logical cluster access",
 		},
 		{
-			testName: "service account from root cluster is granted access on root",
+			testName: "service account from root:authenticated cluster is granted access on root:authenticated",
 
-			requestedWorkspace: "root",
-			requestingUser:     newServiceAccountWithCluster("somebody", "root", "system:authenticated"),
+			requestedWorkspace: "root:authenticated",
+			requestingUser:     newServiceAccountWithCluster("somebody", "root:authenticated", "system:authenticated"),
 			wantDecision:       authorizer.DecisionAllow,
 			wantReason:         "delegating due to local service account access",
 		},
@@ -173,15 +186,25 @@ func TestWorkspaceContentAuthorizer(t *testing.T) {
 			testName: "system:kcp:logical-cluster-admin can always pass",
 
 			requestedWorkspace: "root:non-existent",
-			requestingUser:     newUser("lcluster-admin", "system:kcp:logical-cluster-admin"),
+			requestingUser:     &user.DefaultInfo{Name: "lcluster-admin", Groups: []string{"system:kcp:logical-cluster-admin"}},
 			wantDecision:       authorizer.DecisionAllow,
 			wantReason:         "delegating due to logical cluster admin access",
+		},
+		{
+			testName: "system:kcp:logical-cluster-admin can always pass with exeception if scoped",
+
+			requestedWorkspace: "root:non-existent",
+			requestingUser: &user.DefaultInfo{Name: "lcluster-admin", Extra: map[string][]string{
+				"authentication.kcp.io/scopes": {"cluster:other"},
+			}, Groups: []string{"system:kcp:logical-cluster-admin"}},
+			wantDecision: authorizer.DecisionDeny,
+			wantReason:   "LogicalCluster not found",
 		},
 		{
 			testName: "permitted user is granted access to initializing workspace",
 
 			requestedWorkspace: "root:initializing",
-			requestingUser:     newUser("user-access", "system:authenticated"),
+			requestingUser:     &user.DefaultInfo{Name: "user-access", Groups: []string{"system:authenticated"}},
 			wantDecision:       authorizer.DecisionAllow,
 			wantReason:         "delegating due to user logical cluster access",
 		},
@@ -189,7 +212,7 @@ func TestWorkspaceContentAuthorizer(t *testing.T) {
 			testName: "any user passed for deep SAR",
 
 			requestedWorkspace: "root:ready",
-			requestingUser:     newUser("user-unknown"),
+			requestingUser:     &user.DefaultInfo{Name: "user-unknown"},
 			deepSARHeader:      true,
 			wantDecision:       authorizer.DecisionAllow,
 			wantReason:         "delegating due to deep SAR request",
@@ -225,9 +248,9 @@ func TestWorkspaceContentAuthorizer(t *testing.T) {
 				&v1.ClusterRoleBinding{
 					ObjectMeta: metav1.ObjectMeta{
 						Annotations: map[string]string{
-							logicalcluster.AnnotationKey: "root",
+							logicalcluster.AnnotationKey: "root:authenticated",
 						},
-						Name: "system:authenticated:access",
+						Name: "system:authenticated:root:authenticated:access",
 					},
 					Subjects: []v1.Subject{
 						{
@@ -247,7 +270,7 @@ func TestWorkspaceContentAuthorizer(t *testing.T) {
 						Annotations: map[string]string{
 							logicalcluster.AnnotationKey: "root:ready",
 						},
-						Name: "user-access-ready-access",
+						Name: "user-access:root:ready:access",
 					},
 					Subjects: []v1.Subject{
 						{
@@ -267,7 +290,7 @@ func TestWorkspaceContentAuthorizer(t *testing.T) {
 						Annotations: map[string]string{
 							logicalcluster.AnnotationKey: "root:initializing",
 						},
-						Name: "user-access-initializing-access",
+						Name: "user-access:root:initializing:access",
 					},
 					Subjects: []v1.Subject{
 						{
@@ -287,7 +310,7 @@ func TestWorkspaceContentAuthorizer(t *testing.T) {
 						Annotations: map[string]string{
 							logicalcluster.AnnotationKey: "rootwithoutparent",
 						},
-						Name: "system:authenticated:access",
+						Name: "user-access:rootwithoutparent:access",
 					},
 					Subjects: []v1.Subject{
 						{
@@ -320,7 +343,7 @@ func TestWorkspaceContentAuthorizer(t *testing.T) {
 
 			localIndexer := cache.NewIndexer(kcpcache.MetaClusterNamespaceKeyFunc, cache.Indexers{})
 			require.NoError(t, localIndexer.Add(&corev1alpha1.LogicalCluster{
-				ObjectMeta: metav1.ObjectMeta{Name: corev1alpha1.LogicalClusterName, Annotations: map[string]string{logicalcluster.AnnotationKey: "root"}},
+				ObjectMeta: metav1.ObjectMeta{Name: corev1alpha1.LogicalClusterName, Annotations: map[string]string{logicalcluster.AnnotationKey: "root:authenticated"}},
 				Status:     corev1alpha1.LogicalClusterStatus{Phase: corev1alpha1.LogicalClusterPhaseReady},
 			}))
 			require.NoError(t, localIndexer.Add(&corev1alpha1.LogicalCluster{
@@ -346,7 +369,7 @@ func TestWorkspaceContentAuthorizer(t *testing.T) {
 			globalLogicalClusters := corev1alpha1listers.NewLogicalClusterClusterLister(globalIndexer)
 
 			recordingAuthorizer := &recordingAuthorizer{decision: authorizer.DecisionAllow, reason: "allowed"}
-			w := NewWorkspaceContentAuthorizer(local, global, localLogicalClusters, globalLogicalClusters, recordingAuthorizer)
+			w := NewWorkspaceContentAuthorizer(local, global, localLogicalClusters, globalLogicalClusters)(recordingAuthorizer)
 
 			requestedCluster := request.Cluster{
 				Name: logicalcluster.Name(tt.requestedWorkspace),
