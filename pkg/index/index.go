@@ -253,29 +253,87 @@ func (c *State) UpsertLogicalCluster(shard string, logicalCluster *corev1alpha1.
 	got := c.clusterShards[clusterName]
 	c.lock.RUnlock()
 
-	if got != shard {
-		c.lock.Lock()
-		defer c.lock.Unlock()
+	if got == shard {
+		return
+	}
 
-		// If got is not empty then the logical cluster was migrated from shard `got` to shard `shard`.
-		// Record the timestamp and delete the context from the manager.
-		// The timestamp is recorded so clients with a watch are getting a 410 sent back to trigger a full relist.
-		// The context is cancelled to force close watches, which will then cause them to get the aforementioned 410s to relist.
-		// The relist is important because the RV on the destination shard will be different, leading to erroneous watch results if no relist is done.
-		if got != "" {
-			c.migratedAt.Store(clusterName, c.now())
-			c.clusterContexts.Delete(clusterName, fmt.Errorf("logical cluster %s migrated from shard %s to shard %s", clusterName, got, shard))
+	c.lock.Lock()
+	defer c.lock.Unlock()
+
+	// Re-read under write lock, a concurrent upsert may have won the race.
+	got = c.clusterShards[clusterName]
+	if got == shard {
+		return
+	}
+
+	// If the migrating annotation is set do not handle the update at all.
+	// The delete event from the origin shard is processed in DeleteLogicalCluster.
+	// The update event from the destination shard must only be
+	// processed (as in, cause the entries in the front-proxies maps to
+	// be updated) after the migration has finished and the annotation
+	// has been removed from the LC.
+	// TODO(ntnn): Make the migrating annotation part of the API.
+	if logicalCluster.Annotations["internal.kcp.io/migrating"] != "" {
+		return
+	}
+
+	// If got is not empty then the logical cluster was migrated from shard `got` to shard `shard`.
+	// Record the timestamp and delete the context from the manager.
+	// The timestamp is recorded so clients with a watch are getting a 410 sent back to trigger a full relist.
+	// The context is cancelled to force close watches, which will then cause them to get the aforementioned 410s to relist.
+	// The relist is important because the RV on the destination shard will be different, leading to erroneous watch results if no relist is done.
+	if got != "" {
+		c.migratedAt.Store(clusterName, c.now())
+		c.clusterContexts.Delete(clusterName, fmt.Errorf("logical cluster %s migrated from shard %s to shard %s", clusterName, got, shard))
+	}
+
+	c.clusterShards[clusterName] = shard
+
+	// LogicalClusters are annotated with "path:name" of their workspace's type.
+	typeIdent := logicalcluster.NewPath(logicalCluster.Annotations[tenancyv1alpha1.LogicalClusterTypeAnnotationKey])
+
+	if c.shardClusterWorkspaceType[shard] == nil {
+		c.shardClusterWorkspaceType[shard] = map[logicalcluster.Name]logicalcluster.Path{}
+	}
+	c.shardClusterWorkspaceType[shard][clusterName] = typeIdent
+
+	// Use the LC owner to fill the rest of the maps
+	owner := logicalCluster.Spec.Owner
+	if owner == nil || owner.Resource != "workspaces" || owner.Name == "" || owner.Cluster == "" {
+		return
+	}
+
+	parentCluster := logicalcluster.Name(owner.Cluster)
+
+	// The edges are keyed by the shard the parent's Workspace lives on.
+	// If the parent is not known yet the Workspace event will fill the edges.
+	parentShard, found := c.clusterShards[parentCluster]
+	if !found {
+		return
+	}
+
+	if _, found := c.shardClusterWorkspaceNameCluster[parentShard][parentCluster][owner.Name]; !found {
+		if c.shardClusterWorkspaceNameCluster[parentShard] == nil {
+			c.shardClusterWorkspaceNameCluster[parentShard] = map[logicalcluster.Name]map[string]logicalcluster.Name{}
 		}
-
-		c.clusterShards[clusterName] = shard
-
-		// LogicalClusters are annotated with "path:name" of their workspace's type.
-		typeIdent := logicalcluster.NewPath(logicalCluster.Annotations[tenancyv1alpha1.LogicalClusterTypeAnnotationKey])
-
-		if c.shardClusterWorkspaceType[shard] == nil {
-			c.shardClusterWorkspaceType[shard] = map[logicalcluster.Name]logicalcluster.Path{}
+		if c.shardClusterWorkspaceNameCluster[parentShard][parentCluster] == nil {
+			c.shardClusterWorkspaceNameCluster[parentShard][parentCluster] = map[string]logicalcluster.Name{}
 		}
-		c.shardClusterWorkspaceType[shard][clusterName] = typeIdent
+		c.shardClusterWorkspaceNameCluster[parentShard][parentCluster][owner.Name] = clusterName
+	}
+
+	if _, found := c.shardClusterWorkspaceName[parentShard][clusterName]; !found {
+		if c.shardClusterWorkspaceName[parentShard] == nil {
+			c.shardClusterWorkspaceName[parentShard] = map[logicalcluster.Name]string{}
+		}
+		c.shardClusterWorkspaceName[parentShard][clusterName] = owner.Name
+	}
+
+	if _, found := c.shardClusterParentCluster[parentShard][clusterName]; !found {
+		if c.shardClusterParentCluster[parentShard] == nil {
+			c.shardClusterParentCluster[parentShard] = map[logicalcluster.Name]logicalcluster.Name{}
+		}
+		c.shardClusterParentCluster[parentShard][clusterName] = parentCluster
 	}
 }
 
@@ -292,10 +350,18 @@ func (c *State) DeleteLogicalCluster(shard string, logicalCluster *corev1alpha1.
 
 	c.lock.Lock()
 	defer c.lock.Unlock()
-	if got := c.clusterShards[clusterName]; got == shard {
-		delete(c.clusterShards, clusterName)
-		c.clusterContexts.Delete(clusterName, fmt.Errorf("logical cluster %s deleted from shard %s", clusterName, shard))
+	// Re-read under write lock, a concurrent upsert may have won the race.
+	got = c.clusterShards[clusterName]
+	if got != shard {
+		// The shard in the mapping changed between the read- and
+		// write-locked read, all related changes in the other maps are
+		// already updated.
+		return
 	}
+
+	// delete LC from shard->LC map
+	delete(c.clusterShards, clusterName)
+	c.clusterContexts.Delete(clusterName, fmt.Errorf("logical cluster %s deleted from shard %s", clusterName, shard))
 
 	// This LC keyed as the cluster being addressed.
 	delete(c.shardClusterWorkspaceType[shard], clusterName)
@@ -383,6 +449,12 @@ func (c *State) UpsertShard(shardName, baseURL string) {
 	if got != baseURL {
 		c.lock.Lock()
 		defer c.lock.Unlock()
+
+		// Re-read under write lock, a concurrent upsert may have won the race.
+		if c.shardBaseURLs[shardName] == baseURL {
+			return
+		}
+
 		c.shardBaseURLs[shardName] = baseURL
 	}
 }
